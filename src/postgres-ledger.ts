@@ -2,18 +2,23 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Pool, type PoolClient, type PoolConfig } from 'pg';
 import type { AccountType, LedgerAccount, LedgerTransaction, Posting } from './ledger.js';
 
-export type PostgresLedgerOptions = { pool?: Pool; connection?: PoolConfig };
+export type PostgresLedgerOptions = { pool?: Pool; connection?: PoolConfig; serializationRetries?: number };
+export type LedgerPostInput = Omit<LedgerTransaction,'id'|'createdAt'|'previousHash'|'hash'>;
 
 const txKinds = new Set<LedgerTransaction['kind']>(['topup','transfer','payment','refund','payout','adjustment']);
 const serialize = (value: unknown): string => JSON.stringify(value, (_, entry) => typeof entry === 'bigint' ? entry.toString() : entry);
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class PostgresClosedLoopLedger {
   readonly pool: Pool;
   private readonly ownsPool: boolean;
+  private readonly serializationRetries: number;
 
   constructor(options: PostgresLedgerOptions = {}) {
     if (options.pool) { this.pool = options.pool; this.ownsPool = false; }
     else { this.pool = new Pool(options.connection ?? { connectionString: process.env.DATABASE_URL }); this.ownsPool = true; }
+    this.serializationRetries = options.serializationRetries ?? 5;
+    if (!Number.isInteger(this.serializationRetries) || this.serializationRetries < 0 || this.serializationRetries > 20) throw new Error('serializationRetries must be between 0 and 20');
   }
 
   async close(): Promise<void> { if (this.ownsPool) await this.pool.end(); }
@@ -26,38 +31,43 @@ export class PostgresClosedLoopLedger {
       `INSERT INTO boop_ledger_accounts (id,owner_id,currency,account_type,status) VALUES ($1,$2,$3,$4,'active') RETURNING id,owner_id,currency,account_type,status`,
       [id, ownerId, currency, type],
     );
-    const row = result.rows[0];
-    return { id: row.id, ownerId: row.owner_id, currency: row.currency, type: row.account_type, status: row.status };
+    return this.rowToAccount(result.rows[0]);
   }
 
-  async post(input: Omit<LedgerTransaction,'id'|'createdAt'|'previousHash'|'hash'>): Promise<LedgerTransaction> {
+  async setAccountStatus(accountId: string, status: LedgerAccount['status']): Promise<LedgerAccount> {
+    const result = await this.pool.query(
+      `UPDATE boop_ledger_accounts SET status=$2 WHERE id=$1 RETURNING id,owner_id,currency,account_type,status`,
+      [accountId, status],
+    );
+    if (!result.rowCount) throw new Error(`Unknown account: ${accountId}`);
+    return this.rowToAccount(result.rows[0]);
+  }
+
+  async post(input: LedgerPostInput): Promise<LedgerTransaction> {
     this.validateInput(input);
-    return this.serializable(async (client) => this.postWithClient(client, input, true));
+    return this.runSerializable((client) => this.postInTransaction(client, input, true));
   }
 
   async transfer(fromAccountId: string, toAccountId: string, amountMinor: bigint, idempotencyKey: string, kind: LedgerTransaction['kind'] = 'transfer'): Promise<LedgerTransaction> {
     if (amountMinor <= 0n) throw new Error('amountMinor must be positive');
     if (fromAccountId === toAccountId) throw new Error('Source and destination accounts must be different');
-    return this.serializable(async (client) => {
-      const existing = await this.findByIdempotency(client, idempotencyKey);
+    return this.runSerializable(async (client) => {
+      const existing = await this.findByIdempotencyInTransaction(client, idempotencyKey);
       if (existing) return existing;
-      const rows = await client.query(
-        `SELECT id,currency,status FROM boop_ledger_accounts WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE`,
-        [[fromAccountId, toAccountId]],
-      );
-      if (rows.rowCount !== 2) throw new Error('Transfer accounts do not exist');
-      if (rows.rows.some((row) => row.status !== 'active')) throw new Error('Transfer account is not active');
-      if (new Set(rows.rows.map((row) => row.currency)).size !== 1) throw new Error('Closed-loop transfer accounts must use the same currency');
-      const balance = await this.balanceWithClient(client, fromAccountId);
+      const accounts = await this.lockAccountsInTransaction(client, [fromAccountId, toAccountId], 'update');
+      if (accounts[0].currency !== accounts[1].currency) throw new Error('Closed-loop transfer accounts must use the same currency');
+      const balance = await this.balanceInTransaction(client, fromAccountId);
       const held = await client.query(
-        `SELECT COALESCE(SUM(amount_minor),0)::text AS held FROM boop_authorization_holds WHERE payer_account_id=$1 AND status='authorized'`,
+        `SELECT COALESCE(SUM(amount_minor - captured_minor),0)::text AS held
+         FROM boop_authorization_holds
+         WHERE payer_account_id=$1 AND status IN ('authorized','partially-captured')`,
         [fromAccountId],
       );
       if (balance - BigInt(held.rows[0].held) < amountMinor) throw new Error('Insufficient available balance');
-      return this.postWithClient(client, {
+      return this.postInTransaction(client, {
         idempotencyKey,
         kind,
-        currency: rows.rows[0].currency,
+        currency: accounts[0].currency,
         postings: [{ accountId: fromAccountId, amountMinor: -amountMinor }, { accountId: toAccountId, amountMinor }],
         metadata: {},
       }, false);
@@ -67,9 +77,23 @@ export class PostgresClosedLoopLedger {
   async balance(accountId: string): Promise<bigint> {
     const client = await this.pool.connect();
     try {
-      const exists = await client.query('SELECT 1 FROM boop_ledger_accounts WHERE id=$1', [accountId]);
-      if (!exists.rowCount) throw new Error(`Unknown account: ${accountId}`);
-      return await this.balanceWithClient(client, accountId);
+      await this.requireAccountInTransaction(client, accountId);
+      return await this.balanceInTransaction(client, accountId);
+    } finally { client.release(); }
+  }
+
+  async availableBalance(accountId: string): Promise<bigint> {
+    const client = await this.pool.connect();
+    try {
+      await this.requireAccountInTransaction(client, accountId);
+      const balance = await this.balanceInTransaction(client, accountId);
+      const held = await client.query(
+        `SELECT COALESCE(SUM(amount_minor - captured_minor),0)::text AS held
+         FROM boop_authorization_holds
+         WHERE payer_account_id=$1 AND status IN ('authorized','partially-captured')`,
+        [accountId],
+      );
+      return balance - BigInt(held.rows[0].held);
     } finally { client.release(); }
   }
 
@@ -84,56 +108,63 @@ export class PostgresClosedLoopLedger {
     return this.rowsToTransactions(result.rows);
   }
 
-  async verifyChain(): Promise<boolean> {
-    const count = await this.pool.query(`SELECT COUNT(*)::int AS count FROM boop_ledger_transactions`);
-    if (count.rows[0].count > 10_000) throw new Error('Full chain verification requires a paginated verifier for journals larger than 10000 transactions');
-    const history = await this.history(10_000);
+  async verifyChain(batchSize = 1000): Promise<boolean> {
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 10_000) throw new Error('batchSize must be between 1 and 10000');
+    let cursor = 0n;
     let previousHash = 'GENESIS';
-    for (const transaction of history) {
-      if (transaction.previousHash !== previousHash) return false;
-      const { hash, ...base } = transaction;
-      if (createHash('sha256').update(serialize(base)).digest('hex') !== hash) return false;
-      previousHash = hash;
+    for (;;) {
+      const result = await this.pool.query(
+        `WITH batch AS (
+           SELECT id,ledger_sequence FROM boop_ledger_transactions
+           WHERE ledger_sequence > $1::bigint ORDER BY ledger_sequence ASC LIMIT $2
+         )
+         SELECT t.id,t.idempotency_key,t.kind,t.currency,t.created_at,t.metadata,t.previous_hash,t.hash,b.ledger_sequence,p.sequence,p.account_id,p.amount_minor::text
+         FROM batch b
+         JOIN boop_ledger_transactions t ON t.id=b.id
+         JOIN boop_ledger_postings p ON p.transaction_id=t.id
+         ORDER BY b.ledger_sequence ASC,p.sequence ASC`,
+        [cursor.toString(), batchSize],
+      );
+      if (!result.rowCount) return true;
+      const transactions = this.rowsToTransactions(result.rows);
+      for (const transaction of transactions) {
+        if (transaction.previousHash !== previousHash) return false;
+        const { hash, ...base } = transaction;
+        if (createHash('sha256').update(serialize(base)).digest('hex') !== hash) return false;
+        previousHash = hash;
+      }
+      cursor = BigInt(result.rows[result.rows.length - 1].ledger_sequence);
+      if (transactions.length < batchSize) return true;
     }
-    return true;
   }
 
-  private validateInput(input: Omit<LedgerTransaction,'id'|'createdAt'|'previousHash'|'hash'>): void {
-    if (!input.idempotencyKey.trim()) throw new Error('idempotencyKey is required');
-    if (!txKinds.has(input.kind)) throw new Error('Unsupported transaction kind');
-    if (input.postings.length < 2) throw new Error('A transaction requires at least two postings');
-    if (input.postings.some((posting) => posting.amountMinor === 0n)) throw new Error('Zero-value postings are not allowed');
-    if (input.postings.reduce((sum, posting) => sum + posting.amountMinor, 0n) !== 0n) throw new Error('Ledger transaction must balance to zero');
-  }
-
-  private async serializable<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
+  async runSerializable<T>(work: (client: PoolClient) => Promise<T>): Promise<T> {
     const client = await this.pool.connect();
     try {
-      await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
-      const result = await work(client);
-      await client.query('COMMIT');
-      return result;
-    } catch (error) {
-      await client.query('ROLLBACK').catch(() => undefined);
-      throw error;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          await client.query('BEGIN ISOLATION LEVEL SERIALIZABLE');
+          const result = await work(client);
+          await client.query('COMMIT');
+          return result;
+        } catch (error: any) {
+          await client.query('ROLLBACK').catch(() => undefined);
+          const retryable = error?.code === '40001' || error?.code === '40P01';
+          if (!retryable || attempt >= this.serializationRetries) throw error;
+          await sleep(Math.min(100, 5 * 2 ** attempt) + Math.floor(Math.random() * 7));
+        }
+      }
     } finally { client.release(); }
   }
 
-  private async postWithClient(client: PoolClient, input: Omit<LedgerTransaction,'id'|'createdAt'|'previousHash'|'hash'>, lockAccounts: boolean): Promise<LedgerTransaction> {
+  async postInTransaction(client: PoolClient, input: LedgerPostInput, lockAccounts = true): Promise<LedgerTransaction> {
     this.validateInput(input);
-    const existing = await this.findByIdempotency(client, input.idempotencyKey);
+    const existing = await this.findByIdempotencyInTransaction(client, input.idempotencyKey);
     if (existing) return existing;
     await client.query('LOCK TABLE boop_ledger_transactions IN SHARE ROW EXCLUSIVE MODE');
     const accountIds = [...new Set(input.postings.map((posting) => posting.accountId))];
-    const accounts = await client.query(
-      `SELECT id,currency,status FROM boop_ledger_accounts WHERE id = ANY($1::uuid[]) ${lockAccounts ? 'FOR UPDATE' : 'FOR SHARE'}`,
-      [accountIds],
-    );
-    if (accounts.rowCount !== accountIds.length) throw new Error('One or more ledger accounts do not exist');
-    for (const row of accounts.rows) {
-      if (row.status !== 'active') throw new Error(`Account is not active: ${row.id}`);
-      if (row.currency !== input.currency) throw new Error('Cross-currency posting requires an explicit FX transaction');
-    }
+    const accounts = await this.lockAccountsInTransaction(client, accountIds, lockAccounts ? 'update' : 'share');
+    for (const account of accounts) if (account.currency !== input.currency) throw new Error('Cross-currency posting requires an explicit FX transaction');
     const head = await client.query('SELECT hash FROM boop_ledger_transactions ORDER BY ledger_sequence DESC LIMIT 1');
     const previousHash = head.rows[0]?.hash ?? 'GENESIS';
     const id = randomUUID();
@@ -152,18 +183,47 @@ export class PostgresClosedLoopLedger {
     return { ...base, hash };
   }
 
-  private async balanceWithClient(client: PoolClient, accountId: string): Promise<bigint> {
+  async balanceInTransaction(client: PoolClient, accountId: string): Promise<bigint> {
     const result = await client.query(`SELECT COALESCE(SUM(amount_minor),0)::text AS balance FROM boop_ledger_postings WHERE account_id=$1`, [accountId]);
     return BigInt(result.rows[0].balance);
   }
 
-  private async findByIdempotency(client: PoolClient, key: string): Promise<LedgerTransaction | undefined> {
+  async findByIdempotencyInTransaction(client: PoolClient, key: string): Promise<LedgerTransaction | undefined> {
     const result = await client.query(
       `SELECT t.id,t.idempotency_key,t.kind,t.currency,t.created_at,t.metadata,t.previous_hash,t.hash,t.ledger_sequence,p.sequence,p.account_id,p.amount_minor::text
        FROM boop_ledger_transactions t JOIN boop_ledger_postings p ON p.transaction_id=t.id WHERE t.idempotency_key=$1 ORDER BY p.sequence`, [key],
     );
     if (!result.rowCount) return undefined;
     return this.rowsToTransactions(result.rows)[0];
+  }
+
+  async lockAccountsInTransaction(client: PoolClient, accountIds: string[], lock: 'update' | 'share'): Promise<Array<Pick<LedgerAccount,'id'|'currency'|'status'>>> {
+    const unique = [...new Set(accountIds)];
+    const result = await client.query(
+      `SELECT id,currency,status FROM boop_ledger_accounts WHERE id = ANY($1::uuid[]) ORDER BY id ${lock === 'update' ? 'FOR UPDATE' : 'FOR SHARE'}`,
+      [unique],
+    );
+    if (result.rowCount !== unique.length) throw new Error('One or more ledger accounts do not exist');
+    const accounts = result.rows.map((row) => ({ id: row.id, currency: row.currency, status: row.status as LedgerAccount['status'] }));
+    for (const account of accounts) if (account.status !== 'active') throw new Error(`Account is not active: ${account.id}`);
+    return accounts;
+  }
+
+  private async requireAccountInTransaction(client: PoolClient, accountId: string): Promise<void> {
+    const result = await client.query('SELECT 1 FROM boop_ledger_accounts WHERE id=$1', [accountId]);
+    if (!result.rowCount) throw new Error(`Unknown account: ${accountId}`);
+  }
+
+  private validateInput(input: LedgerPostInput): void {
+    if (!input.idempotencyKey.trim()) throw new Error('idempotencyKey is required');
+    if (!txKinds.has(input.kind)) throw new Error('Unsupported transaction kind');
+    if (input.postings.length < 2) throw new Error('A transaction requires at least two postings');
+    if (input.postings.some((posting) => posting.amountMinor === 0n)) throw new Error('Zero-value postings are not allowed');
+    if (input.postings.reduce((sum, posting) => sum + posting.amountMinor, 0n) !== 0n) throw new Error('Ledger transaction must balance to zero');
+  }
+
+  private rowToAccount(row: any): LedgerAccount {
+    return { id: row.id, ownerId: row.owner_id, currency: row.currency, type: row.account_type, status: row.status };
   }
 
   private rowsToTransactions(rows: any[]): LedgerTransaction[] {
