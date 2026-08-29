@@ -76,15 +76,17 @@ export class PostgresClosedLoopLedger {
   async history(limit = 1000): Promise<LedgerTransaction[]> {
     if (!Number.isInteger(limit) || limit < 1 || limit > 10_000) throw new Error('limit must be between 1 and 10000');
     const result = await this.pool.query(
-      `SELECT t.id,t.idempotency_key,t.kind,t.currency,t.created_at,t.metadata,t.previous_hash,t.hash,p.sequence,p.account_id,p.amount_minor::text
+      `SELECT t.id,t.idempotency_key,t.kind,t.currency,t.created_at,t.metadata,t.previous_hash,t.hash,t.ledger_sequence,p.sequence,p.account_id,p.amount_minor::text
        FROM boop_ledger_transactions t JOIN boop_ledger_postings p ON p.transaction_id=t.id
-       WHERE t.id IN (SELECT id FROM boop_ledger_transactions ORDER BY created_at DESC,id DESC LIMIT $1)
-       ORDER BY t.created_at ASC,t.id ASC,p.sequence ASC`, [limit],
+       WHERE t.id IN (SELECT id FROM boop_ledger_transactions ORDER BY ledger_sequence DESC LIMIT $1)
+       ORDER BY t.ledger_sequence ASC,p.sequence ASC`, [limit],
     );
     return this.rowsToTransactions(result.rows);
   }
 
   async verifyChain(): Promise<boolean> {
+    const count = await this.pool.query(`SELECT COUNT(*)::int AS count FROM boop_ledger_transactions`);
+    if (count.rows[0].count > 10_000) throw new Error('Full chain verification requires a paginated verifier for journals larger than 10000 transactions');
     const history = await this.history(10_000);
     let previousHash = 'GENESIS';
     for (const transaction of history) {
@@ -132,7 +134,7 @@ export class PostgresClosedLoopLedger {
       if (row.status !== 'active') throw new Error(`Account is not active: ${row.id}`);
       if (row.currency !== input.currency) throw new Error('Cross-currency posting requires an explicit FX transaction');
     }
-    const head = await client.query('SELECT hash FROM boop_ledger_transactions ORDER BY created_at DESC,id DESC LIMIT 1');
+    const head = await client.query('SELECT hash FROM boop_ledger_transactions ORDER BY ledger_sequence DESC LIMIT 1');
     const previousHash = head.rows[0]?.hash ?? 'GENESIS';
     const id = randomUUID();
     const createdAt = new Date().toISOString();
@@ -157,7 +159,7 @@ export class PostgresClosedLoopLedger {
 
   private async findByIdempotency(client: PoolClient, key: string): Promise<LedgerTransaction | undefined> {
     const result = await client.query(
-      `SELECT t.id,t.idempotency_key,t.kind,t.currency,t.created_at,t.metadata,t.previous_hash,t.hash,p.sequence,p.account_id,p.amount_minor::text
+      `SELECT t.id,t.idempotency_key,t.kind,t.currency,t.created_at,t.metadata,t.previous_hash,t.hash,t.ledger_sequence,p.sequence,p.account_id,p.amount_minor::text
        FROM boop_ledger_transactions t JOIN boop_ledger_postings p ON p.transaction_id=t.id WHERE t.idempotency_key=$1 ORDER BY p.sequence`, [key],
     );
     if (!result.rowCount) return undefined;
