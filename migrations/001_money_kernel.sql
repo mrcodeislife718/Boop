@@ -9,8 +9,11 @@ CREATE TABLE IF NOT EXISTS boop_ledger_accounts (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE SEQUENCE IF NOT EXISTS boop_ledger_sequence;
+
 CREATE TABLE IF NOT EXISTS boop_ledger_transactions (
   id uuid PRIMARY KEY,
+  ledger_sequence bigint NOT NULL DEFAULT nextval('boop_ledger_sequence'),
   idempotency_key text NOT NULL UNIQUE,
   kind text NOT NULL CHECK (kind IN ('topup','transfer','payment','refund','payout','adjustment')),
   currency char(3) NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
@@ -19,6 +22,12 @@ CREATE TABLE IF NOT EXISTS boop_ledger_transactions (
   previous_hash text NOT NULL,
   hash text NOT NULL UNIQUE
 );
+
+ALTER TABLE boop_ledger_transactions ADD COLUMN IF NOT EXISTS ledger_sequence bigint;
+ALTER TABLE boop_ledger_transactions ALTER COLUMN ledger_sequence SET DEFAULT nextval('boop_ledger_sequence');
+UPDATE boop_ledger_transactions SET ledger_sequence = nextval('boop_ledger_sequence') WHERE ledger_sequence IS NULL;
+ALTER TABLE boop_ledger_transactions ALTER COLUMN ledger_sequence SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS boop_transactions_sequence_idx ON boop_ledger_transactions(ledger_sequence);
 
 CREATE TABLE IF NOT EXISTS boop_ledger_postings (
   transaction_id uuid NOT NULL REFERENCES boop_ledger_transactions(id) ON DELETE RESTRICT,
